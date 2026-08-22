@@ -6,14 +6,65 @@ LLM客户端封装
 import json
 import logging
 import re
+import threading
+import time
 from typing import Optional, Dict, Any, List
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError, APIStatusError
 
 from ..config import Config
 from .openai_chat_compat import create_chat_completion, extract_chat_completion_text
 
 
 logger = logging.getLogger(__name__)
+
+
+# 模型冷却表（模块级，跨 LLMClient 实例共享）：model -> 恢复时间戳
+_model_cooldowns: Dict[str, float] = {}
+_model_cooldowns_lock = threading.Lock()
+MODEL_COOLDOWN_SECONDS = 60.0
+
+# Proxies that front Anthropic report Anthropic's stop reasons rather than
+# OpenAI's, so both vocabularies have to be accepted.
+#   OpenAI:    stop      / length
+#   Anthropic: end_turn  / max_tokens
+COMPLETE_FINISH_REASONS = frozenset({None, "stop", "end_turn", "stop_sequence", "eos"})
+TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "model_length"})
+
+
+def _is_failover_worthy(error: Exception) -> bool:
+    """仅服务端/网络类错误触发模型切换；4xx 业务错误直接上抛。"""
+
+    if isinstance(error, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(error, APIStatusError):
+        status = getattr(error, "status_code", None)
+        return status in {408, 429} or (status is not None and status >= 500)
+    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+        return True
+    return False
+
+
+def _mark_model_cooldown(model: str, seconds: float = MODEL_COOLDOWN_SECONDS) -> None:
+    with _model_cooldowns_lock:
+        _model_cooldowns[model] = time.time() + seconds
+
+
+def _model_in_cooldown(model: str) -> bool:
+    with _model_cooldowns_lock:
+        until = _model_cooldowns.get(model)
+        if until is None:
+            return False
+        if time.time() >= until:
+            del _model_cooldowns[model]
+            return False
+        return True
+
+
+def clear_model_cooldowns() -> None:
+    """清空冷却表（测试用）。"""
+
+    with _model_cooldowns_lock:
+        _model_cooldowns.clear()
 
 
 class LLMResponseError(ValueError):
@@ -64,7 +115,7 @@ def _is_response_format_unsupported(error: Exception) -> bool:
     )
 
 
-def _clean_chat_text(content: str) -> str:
+def clean_chat_text(content: str) -> str:
     """Remove common reasoning wrappers and an outer Markdown JSON fence."""
 
     cleaned = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
@@ -100,7 +151,7 @@ class LLMClient:
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model = model or Config.LLM_MODEL_NAME
-        
+
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
         
@@ -108,6 +159,17 @@ class LLMClient:
             api_key=self.api_key,
             base_url=self.base_url
         )
+
+    @property
+    def model_chain(self) -> List[str]:
+        """主模型 + 配置的备选模型（去重、保持顺序）。
+
+        用属性而非实例字段：调用方可以在构造后改写 ``self.model``，
+        failover 链要跟着走。
+        """
+
+        fallbacks = list(Config.LLM_MODEL_FALLBACKS)
+        return [self.model] + [m for m in fallbacks if m != self.model]
 
     def _create_completion(
         self,
@@ -117,16 +179,41 @@ class LLMClient:
         max_tokens: Optional[int],
         response_format: Optional[Dict[str, Any]],
     ) -> Any:
-        """Send one raw Chat Completions request through the compatibility layer."""
+        """按 failover 链发送 Chat Completions 请求。
 
-        return create_chat_completion(
-            self.client,
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-        )
+        服务端/网络错误切换到下一个模型并冷却失败模型；4xx 业务错误直接上抛。
+        """
+
+        last_error: Optional[Exception] = None
+        attempted = False
+        for model in self.model_chain:
+            if _model_in_cooldown(model):
+                logger.info("LLM model %s 处于冷却期，跳过", model)
+                continue
+            attempted = True
+            try:
+                return create_chat_completion(
+                    self.client,
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                )
+            except Exception as error:
+                if not _is_failover_worthy(error):
+                    raise
+                last_error = error
+                _mark_model_cooldown(model)
+                logger.warning(
+                    "LLM model %s 失败（%s: %s），冷却 %ss 并切换备选模型",
+                    model, type(error).__name__, error, MODEL_COOLDOWN_SECONDS,
+                )
+        if last_error is not None:
+            raise last_error
+        if not attempted:
+            raise RuntimeError("所有 LLM 模型均处于冷却期，暂不可用")
+        raise AssertionError("unreachable")
     
     def chat(
         self,
@@ -154,7 +241,7 @@ class LLMClient:
             response_format=response_format,
         )
         content = extract_chat_completion_text(response)
-        return _clean_chat_text(content)
+        return clean_chat_text(content)
     
     def chat_json(
         self,
@@ -239,18 +326,18 @@ class LLMClient:
 
         choice = choices[0]
         finish_reason = getattr(choice, "finish_reason", None)
-        if finish_reason == "length":
+        if finish_reason in TRUNCATED_FINISH_REASONS:
             raise LLMResponseError(
                 "LLM JSON output was truncated at the token limit",
                 finish_reason=finish_reason,
             )
-        if finish_reason not in {None, "stop"}:
+        if finish_reason not in COMPLETE_FINISH_REASONS:
             raise LLMResponseError(
                 f"LLM JSON generation stopped unexpectedly ({finish_reason})",
                 finish_reason=finish_reason,
             )
 
-        content = _clean_chat_text(extract_chat_completion_text(response))
+        content = clean_chat_text(extract_chat_completion_text(response))
         if not content:
             raise LLMResponseError(
                 "LLM returned empty JSON content",

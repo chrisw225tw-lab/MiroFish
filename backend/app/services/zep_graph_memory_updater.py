@@ -14,6 +14,7 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
 from ..utils.zep import (
+    require_graph_backend_credentials,
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
     call_zep_read_with_retry,
     get_zep_client,
@@ -256,9 +257,7 @@ class ZepGraphMemoryUpdater:
         self.graph_id = graph_id
         self.simulation_id = simulation_id or "unknown"
         self.api_key = api_key or Config.ZEP_API_KEY
-        
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY未配置")
+        require_graph_backend_credentials(self.api_key)
         
         self.client = get_zep_client(self.api_key)
         

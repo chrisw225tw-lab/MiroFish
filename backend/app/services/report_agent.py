@@ -2547,20 +2547,32 @@ class ReportManager:
     def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
         """根据模拟ID获取报告"""
         cls._ensure_reports_dir()
-        
+
+        matching_reports = []
         for item in os.listdir(cls.REPORTS_DIR):
             item_path = os.path.join(cls.REPORTS_DIR, item)
             # 新格式：文件夹
             if os.path.isdir(item_path):
                 report = cls.get_report(item)
                 if report and report.simulation_id == simulation_id:
-                    return report
+                    matching_reports.append(report)
             # 兼容旧格式：JSON文件
             elif item.endswith('.json'):
                 report_id = item[:-5]
                 report = cls.get_report(report_id)
                 if report and report.simulation_id == simulation_id:
-                    return report
+                    matching_reports.append(report)
+
+        if matching_reports:
+            matching_reports.sort(
+                key=lambda r: (
+                    r.status == ReportStatus.COMPLETED,
+                    r.completed_at or "",
+                    r.created_at or "",
+                ),
+                reverse=True,
+            )
+            return matching_reports[0]
         
         return None
     

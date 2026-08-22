@@ -10,7 +10,11 @@ from zep_cloud import NotFoundError
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
-from ..utils.zep import call_zep_read_with_retry, get_zep_client
+from ..utils.zep import (
+    call_zep_read_with_retry,
+    get_zep_client,
+    require_graph_backend_credentials,
+)
 
 logger = get_logger('mirofish.zep_entity_reader')
 
@@ -79,8 +83,7 @@ class ZepEntityReader:
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
+        require_graph_backend_credentials(self.api_key)
         
         self.client = get_zep_client(self.api_key)
     

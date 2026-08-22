@@ -1,14 +1,32 @@
 services:
   mirofish:
-    image: ghcr.io/666ghj/mirofish:latest
-    # 加速镜像（如拉取缓慢可替换上方地址）
-    # image: ghcr.nju.edu.cn/666ghj/mirofish:latest
+    # 本地建置：selfhost-graphiti 分支的後端不在上游 image 裡。
+    # 因為是本地 image，watchtower 無法更新它（已從其清單移除）。
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mirofish:selfhost-graphiti
     container_name: mirofish
     env_file:
       - .env
     ports:
-      - "3000:3000"
-      - "5001:5001"
+      - "100.90.255.68:3000:3000"
+      - "100.90.255.68:5001:5001"
     restart: unless-stopped
     volumes:
       - ./backend/uploads:/app/backend/uploads
+    networks:
+      # graphiti-mcp:6379 —— 自架 Graphiti 的 FalkorDB
+      - graphiti
+      # ollama:11434 —— embedding 備援（主力走 GPU 機的 tailscale 位址）
+      - ollamanet
+      - default
+
+networks:
+  graphiti:
+    name: graphiti_default
+    external: true
+  ollamanet:
+    name: litellm_default
+    external: true
+  default: {}

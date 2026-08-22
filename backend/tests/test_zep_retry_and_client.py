@@ -50,6 +50,9 @@ def test_rate_limit_retry_respects_retry_after():
 
 
 def test_zep_client_is_shared_and_uses_an_explicit_timeout(monkeypatch):
+    # Pin the backend: these assert Cloud client construction, and the
+    # developer's .env may select the self-hosted backend.
+    monkeypatch.setattr(zep.Config, "ZEP_BACKEND", "cloud")
     created = []
 
     def fake_zep(**kwargs):
@@ -73,13 +76,45 @@ def test_zep_client_is_shared_and_uses_an_explicit_timeout(monkeypatch):
 
 
 def test_zep_client_rejects_self_hosted_endpoint_override(monkeypatch):
+    monkeypatch.setattr(zep.Config, "ZEP_BACKEND", "cloud")
     monkeypatch.setenv("ZEP_API_URL", "https://example.invalid")
 
     with pytest.raises(ValueError, match="ZEP_API_URL"):
         zep.get_zep_client("test-key")
 
 
+def test_graphiti_backend_bypasses_zep_cloud_entirely(monkeypatch):
+    """ZEP_API_URL is a Cloud-only guard; the local backend never reads it."""
+
+    adapter = object()
+    monkeypatch.setattr(zep.Config, "ZEP_BACKEND", "graphiti")
+    monkeypatch.setenv("ZEP_API_URL", "https://example.invalid")
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "app.services.graphiti_backend",
+        SimpleNamespace(
+            get_graphiti_adapter=lambda: adapter,
+            clear_graphiti_adapter_cache=lambda: None,
+        ),
+    )
+
+    assert zep.get_zep_client() is adapter
+
+
+def test_graphiti_transport_errors_are_retryable_reads():
+    class _RedisConnectionError(Exception):
+        """redis-py raises its own ConnectionError, unrelated to the builtin."""
+
+    _RedisConnectionError.__name__ = "ConnectionError"
+
+    assert zep.is_retryable_zep_error(_RedisConnectionError("falkordb down")) is True
+    assert zep.is_retryable_zep_error(ValueError("bad ontology")) is False
+
+
 def test_zep_client_uses_internal_timeout_and_ignores_env_overrides(monkeypatch):
+    # Pin the backend: these assert Cloud client construction, and the
+    # developer's .env may select the self-hosted backend.
+    monkeypatch.setattr(zep.Config, "ZEP_BACKEND", "cloud")
     created = []
 
     def fake_zep(**kwargs):

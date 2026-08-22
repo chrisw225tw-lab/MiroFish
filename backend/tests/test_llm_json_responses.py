@@ -257,3 +257,39 @@ def test_chat_json_reports_missing_choices_without_retrying_forever():
         )
 
     assert len(sequence.calls) == 2
+
+
+def test_chat_json_accepts_anthropic_stop_reasons():
+    """Proxies fronting Anthropic report end_turn where OpenAI reports stop."""
+
+    sequence = CompletionSequence(_response('{"ok": true}', finish_reason="end_turn"))
+    client = _client_for(sequence)
+
+    assert client.chat_json(messages=[{"role": "user", "content": "x"}]) == {"ok": True}
+
+
+def test_chat_json_treats_anthropic_max_tokens_as_truncation():
+    partial = '{"items": ['
+    sequence = CompletionSequence(
+        _response(partial, finish_reason="max_tokens"),
+        _response(partial, finish_reason="max_tokens"),
+    )
+    client = _client_for(sequence)
+
+    with pytest.raises(LLMResponseError) as captured:
+        client.chat_json(
+            messages=[{"role": "user", "content": "x"}],
+            max_tokens=16,
+            max_attempts=2,
+        )
+
+    assert captured.value.finish_reason == "max_tokens"
+    assert "truncated" in str(captured.value)
+
+
+def test_chat_json_still_rejects_a_genuinely_abnormal_stop():
+    sequence = CompletionSequence(_response('{"ok": true}', finish_reason="content_filter"))
+    client = _client_for(sequence)
+
+    with pytest.raises(LLMResponseError, match="stopped unexpectedly"):
+        client.chat_json(messages=[{"role": "user", "content": "x"}])
